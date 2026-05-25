@@ -3,14 +3,19 @@ import asyncio
 import logging
 from datetime import datetime
 import aiohttp
-from telegram import Bot
 from telegram.ext import Application, CommandHandler
 
-TOKEN    = os.environ.get("BOT_TOKEN", "")
-CHAT_ID  = os.environ.get("CHAT_ID", "")
+TOKEN   = os.environ.get("BOT_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
 SYMBOL   = "BTCUSDT"
 INTERVAL = "5m"
 LIMIT    = 150
+
+# نسب وقف الخسارة وجني الأرباح
+SL_PCT = 1.5   # وقف الخسارة 1.5%
+TP1_PCT = 2.0  # هدف أول 2%
+TP2_PCT = 4.0  # هدف ثاني 4%
+TP3_PCT = 6.0  # هدف ثالث 6%
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s")
@@ -56,6 +61,7 @@ def adx(highs, lows, closes, period=14):
         dx_list.append(abs(p-m)/s*100 if s else 0)
     adx_vals = wilder(dx_list, period)
     return adx_vals[-1], di_plus[-1], di_minus[-1]
+
 async def fetch_klines():
     urls = [
         f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={INTERVAL}&limit={LIMIT}",
@@ -78,6 +84,22 @@ async def fetch_klines():
                 log.warning(f"failed: {e}")
     raise ConnectionError("تعذّر الاتصال بـ Binance")
 
+def calc_levels(price, signal):
+    """حساب مستويات وقف الخسارة وجني الأرباح"""
+    if signal == "BUY":
+        sl  = price * (1 - SL_PCT  / 100)
+        tp1 = price * (1 + TP1_PCT / 100)
+        tp2 = price * (1 + TP2_PCT / 100)
+        tp3 = price * (1 + TP3_PCT / 100)
+    elif signal == "SELL":
+        sl  = price * (1 + SL_PCT  / 100)
+        tp1 = price * (1 - TP1_PCT / 100)
+        tp2 = price * (1 - TP2_PCT / 100)
+        tp3 = price * (1 - TP3_PCT / 100)
+    else:
+        return None
+    return {"sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3}
+
 def get_signal(data):
     closes = data["closes"]
     highs  = data["highs"]
@@ -99,10 +121,12 @@ def get_signal(data):
         signal = "SELL"
     else:
         signal = "WAIT"
+    levels = calc_levels(price, signal)
     return {"signal": signal, "price": price,
             "ema6": e6, "ema10": e10, "ema21": e21, "ema55": e55,
             "adx": adx_val, "di_plus": di_plus, "di_minus": di_minus,
-            "bull_cross": bull_cross, "bear_cross": bear_cross}
+            "bull_cross": bull_cross, "bear_cross": bear_cross,
+            "levels": levels}
 
 def format_message(r, scheduled=False):
     time_str = datetime.now().strftime("%H:%M  %d/%m/%Y")
@@ -115,6 +139,20 @@ def format_message(r, scheduled=False):
     cross = ""
     if r["bull_cross"]: cross = "\n📌 تقاطع EMA صاعد ✅"
     elif r["bear_cross"]: cross = "\n📌 تقاطع EMA هابط ✅"
+
+    # قسم وقف الخسارة وجني الأرباح
+    levels_text = ""
+    if r["levels"]:
+        lv = r["levels"]
+        sl_emoji  = "🛑"
+        tp_emoji  = "🎯"
+        levels_text = f"""
+━━━━━━━━━━━━━━━━
+{sl_emoji} *وقف الخسارة:* `${lv['sl']:,.1f}` _(-{SL_PCT}%)_
+{tp_emoji} *هدف 1:* `${lv['tp1']:,.1f}` _(+{TP1_PCT}%)_
+{tp_emoji} *هدف 2:* `${lv['tp2']:,.1f}` _(+{TP2_PCT}%)_
+{tp_emoji} *هدف 3:* `${lv['tp3']:,.1f}` _(+{TP3_PCT}%)_"""
+
     return f"""
 {emoji} *{header}*
 {'🔔 تحليل مجدول' if scheduled else '🔍 تحليل فوري'}
@@ -125,32 +163,7 @@ def format_message(r, scheduled=False):
 📈 *DI+:* `{r['di_plus']:.1f}`  📉 *DI-:* `{r['di_minus']:.1f}`{cross}
 ━━━━━━━━━━━━━━━━
 EMA6: `{r['ema6']:,.0f}` | EMA10: `{r['ema10']:,.0f}`
-EMA21: `{r['ema21']:,.0f}` | EMA55: `{r['ema55']:,.0f}`
-━━━━━━━━━━━━━━━━
-⚠️ _إشارة مساعدة فقط — قرارك أنت_
-""".strip()
-def format_message(r, scheduled=False):
-    time_str = datetime.now().strftime("%H:%M  %d/%m/%Y")
-    if r["signal"] == "BUY":
-        header, emoji = "إشارة شراء BUY 🟢", "🚀"
-    elif r["signal"] == "SELL":
-        header, emoji = "إشارة بيع SELL 🔴", "🔻"
-    else:
-        header, emoji = "انتظار — لا إشارة ⏳", "😴"
-    cross = ""
-    if r["bull_cross"]: cross = "\n📌 تقاطع EMA صاعد ✅"
-    elif r["bear_cross"]: cross = "\n📌 تقاطع EMA هابط ✅"
-    return f"""
-{emoji} *{header}*
-{'🔔 تحليل مجدول' if scheduled else '🔍 تحليل فوري'}
-━━━━━━━━━━━━━━━━
-💰 *السعر:* `${r['price']:,.1f}`
-🕐 *الوقت:* `{time_str}`
-📊 *ADX:* `{r['adx']:.1f}` {'✅ قوي' if r['adx']>20 else '⚠️ ضعيف'}
-📈 *DI+:* `{r['di_plus']:.1f}`  📉 *DI-:* `{r['di_minus']:.1f}`{cross}
-━━━━━━━━━━━━━━━━
-EMA6: `{r['ema6']:,.0f}` | EMA10: `{r['ema10']:,.0f}`
-EMA21: `{r['ema21']:,.0f}` | EMA55: `{r['ema55']:,.0f}`
+EMA21: `{r['ema21']:,.0f}` | EMA55: `{r['ema55']:,.0f}`{levels_text}
 ━━━━━━━━━━━━━━━━
 ⚠️ _إشارة مساعدة فقط — قرارك أنت_
 """.strip()
@@ -161,7 +174,9 @@ async def cmd_start(update, context):
         "/signal — إشارة فورية\n"
         "/status — حالة المؤشرات\n"
         "/help — المساعدة\n\n"
-        "🔔 إشارات تلقائية كل 4 ساعات",
+        "🔔 إشارات تلقائية كل 4 ساعات\n"
+        "🛑 وقف الخسارة: 1.5%\n"
+        "🎯 أهداف الربح: 2% | 4% | 6%",
         parse_mode="Markdown")
 
 async def cmd_signal(update, context):
@@ -191,11 +206,17 @@ async def cmd_status(update, context):
 async def cmd_help(update, context):
     await update.message.reply_text(
         "📖 *المساعدة*\n"
-        "/signal — تحليل فوري\n"
+        "/signal — تحليل فوري مع وقف الخسارة والأهداف\n"
         "/status — قيم المؤشرات\n"
         "⏰ إشارات تلقائية كل 4 ساعات\n"
-        "📊 الاستراتيجية: 4EMA + ADX | BTCUSD M5",
+        "📊 الاستراتيجية: 4EMA + ADX | BTCUSD M5\n\n"
+        "🛑 *وقف الخسارة:* 1.5% من سعر الدخول\n"
+        "🎯 *الأهداف:*\n"
+        "   • هدف 1: +2%\n"
+        "   • هدف 2: +4%\n"
+        "   • هدف 3: +6%",
         parse_mode="Markdown")
+
 async def send_scheduled(bot):
     try:
         data = await fetch_klines()
@@ -205,41 +226,33 @@ async def send_scheduled(bot):
     except Exception as e:
         log.error(f"Scheduled error: {e}")
 
-async def scheduled_loop(app):
+async def scheduled_loop(bot):
     while True:
-        await send_scheduled(app.bot)
+        await send_scheduled(bot)
         await asyncio.sleep(4 * 60 * 60)
+
+async def post_init(app):
+    asyncio.create_task(scheduled_loop(app.bot))
 
 def main():
     if not TOKEN or not CHAT_ID:
         raise ValueError("BOT_TOKEN و CHAT_ID مطلوبان")
-    app = Application.builder().token(TOKEN).build()
+
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("signal", cmd_signal))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help",   cmd_help))
-    
-def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise ValueError("BOT_TOKEN و CHAT_ID")
-    
-    async def post_init(app):
-        asyncio.create_task(scheduled_loop(app.bot))
-    
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-    
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("signal", cmd_signal))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("help", cmd_help))
-    
-    logger.info("✅ البوت شغال")
+
+    log.info("✅ البوت شغال")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
+

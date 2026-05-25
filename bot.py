@@ -218,10 +218,27 @@ def main():
     app.add_handler(CommandHandler("signal", cmd_signal))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help",   cmd_help))
-    async def post_init(application):
-        asyncio.create_task(scheduled_loop(application))
-    app.post_init = post_init
-    log.info("✅ البوت يعمل")
+    
+def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        raise ValueError("BOT_TOKEN و CHAT_ID")
+    
+    async def post_init(app):
+        asyncio.create_task(scheduled_loop(app.bot))
+    
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+    
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("signal", cmd_signal))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("help", cmd_help))
+    
+    logger.info("✅ البوت شغال")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
